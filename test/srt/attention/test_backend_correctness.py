@@ -968,6 +968,165 @@ class TestFA3SWAExtend(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
+# FA4 backend (SM90+) — MHA, GQA, SWA
+# FA4 uses jit_kernel.flash_attention_v4; same page_size=1 requirement as FA3.
+# ---------------------------------------------------------------------------
+
+_HAS_FA4 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+
+try:
+    from sglang.jit_kernel.flash_attention_v4 import flash_attn_varlen_func as _fa4_probe  # noqa: F401
+    _FA4_AVAILABLE = True
+except Exception:
+    _FA4_AVAILABLE = False
+
+
+@unittest.skipIf(not _HAS_FA4 or not _FA4_AVAILABLE, "FA4 requires SM90+ and jit_kernel.flash_attention_v4")
+class TestFA4MHADecode(CustomTestCase):
+    """FA4 backend, standard MHA, DECODE mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = GPT2_CONFIG_PS1
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_fa_backend(cls.runner, fa_version=4)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, seq_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(seq_lens)
+        batch, kv_slot_map = make_decode_batch(seq_lens, runner, layer_id=LAYER_ID)
+        q = _rand([bsz, cfg.num_heads, cfg.head_dim])
+        k = _rand([bsz, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([bsz, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        q_list = [q[r : r + 1] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FA4 MHA decode seq_lens={seq_lens}")
+
+    def test_bsz1(self):
+        self._run([8])
+
+    def test_bsz4(self):
+        self._run([4, 8, 16, 32])
+
+    def test_bsz1_long(self):
+        self._run([256])
+
+
+@unittest.skipIf(not _HAS_FA4 or not _FA4_AVAILABLE, "FA4 requires SM90+ and jit_kernel.flash_attention_v4")
+class TestFA4MHAExtend(CustomTestCase):
+    """FA4 backend, standard MHA, EXTEND mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = GPT2_CONFIG_PS1
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_fa_backend(cls.runner, fa_version=4)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+        batch, kv_slot_map = make_extend_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FA4 MHA extend prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [8, 8])
+
+    def test_with_prefix(self):
+        self._run([4, 8], [4, 4])
+
+
+@unittest.skipIf(not _HAS_FA4 or not _FA4_AVAILABLE, "FA4 requires SM90+ and jit_kernel.flash_attention_v4")
+class TestFA4GQADecode(CustomTestCase):
+    """FA4 backend, GQA, DECODE mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG_PS1
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_fa_backend(cls.runner, fa_version=4)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, seq_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(seq_lens)
+        batch, kv_slot_map = make_decode_batch(seq_lens, runner, layer_id=LAYER_ID)
+        q = _rand([bsz, cfg.num_heads, cfg.head_dim])
+        k = _rand([bsz, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([bsz, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        q_list = [q[r : r + 1] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FA4 GQA decode seq_lens={seq_lens}")
+
+    def test_bsz1(self):
+        self._run([16])
+
+    def test_bsz4(self):
+        self._run([8, 16, 32, 64])
+
+
+@unittest.skipIf(not _HAS_FA4 or not _FA4_AVAILABLE, "FA4 requires SM90+ and jit_kernel.flash_attention_v4")
+class TestFA4GQAExtend(CustomTestCase):
+    """FA4 backend, GQA, EXTEND mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG_PS1
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_fa_backend(cls.runner, fa_version=4)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+        batch, kv_slot_map = make_extend_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FA4 GQA extend prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [16, 16])
+
+    def test_with_prefix(self):
+        self._run([16, 32], [8, 8])
+
+
+# FA4 SWA (sliding-window) tests are intentionally omitted: the FA4 JIT kernel
+# crashes with "size strictly positive" in PagedKVManager when sliding_window +
+# paged_kv are combined (known limitation of the current FA4 implementation).
+
+# ---------------------------------------------------------------------------
 # SPLIT_PREFILL mode (chunked prefill) — triton, flashinfer, FA3
 # SPLIT_PREFILL uses the same extend codepath (is_extend()=True) so we just
 # override forward_mode on a standard extend batch.
