@@ -76,6 +76,7 @@ def _run_graph_decode_consistency(
     k: torch.Tensor,
     v: torch.Tensor,
     eager_out: torch.Tensor,
+    max_bs: int = None,
 ):
     """
     Capture a CUDA graph for a decode forward and assert replay == eager_out.
@@ -85,13 +86,20 @@ def _run_graph_decode_consistency(
       init_cuda_graph_state → init_forward_metadata_capture_cuda_graph
       → (warmup ×2) → CUDAGraph.capture → init_forward_metadata_replay_cuda_graph
       → g.replay().
+
+    If max_bs > bsz, the backend's static buffers are allocated for a larger
+    capacity than the actual batch; this exercises the padded-buffer slicing
+    that production uses (real runner pads to max_bs == cuda_graph_max_bs).
     """
     bsz = batch.batch_size
+    if max_bs is None:
+        max_bs = bsz
+    assert max_bs >= bsz
     num_heads = layer.tp_q_head_num
     v_head_dim = layer.v_head_dim
 
     # Allocate static backend buffers.
-    backend.init_cuda_graph_state(max_bs=bsz, max_num_tokens=bsz)
+    backend.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_bs)
 
     # Fill static metadata buffers (outside graph context).
     backend.init_forward_metadata_capture_cuda_graph(
@@ -178,17 +186,23 @@ class TestTritonDecodeGraphConsistency(CustomTestCase):
         cls.backend = build_triton_backend(cls.runner)
         cls.layer = _make_layer(cfg)
 
-    def _run(self, seq_lens):
+    def _run(self, seq_lens, max_bs=None):
         batch, q, k, v, eager_out = _run_decode(
             self.backend, self.layer, self.runner, seq_lens
         )
-        _run_graph_decode_consistency(self.layer, self.backend, batch, q, k, v, eager_out)
+        _run_graph_decode_consistency(
+            self.layer, self.backend, batch, q, k, v, eager_out, max_bs=max_bs
+        )
 
     def test_bsz1(self):
         self._run([8])
 
     def test_bsz4(self):
         self._run([4, 8, 16, 32])
+
+    def test_padded_max_bs(self):
+        # bsz=2, max_bs=8 — exercises padded static-buffer slicing
+        self._run([8, 16], max_bs=8)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
@@ -264,17 +278,23 @@ class TestFlashInferDecodeGraphConsistency(CustomTestCase):
         cls.backend = build_flashinfer_backend(cls.runner)
         cls.layer = _make_layer(cfg)
 
-    def _run(self, seq_lens):
+    def _run(self, seq_lens, max_bs=None):
         batch, q, k, v, eager_out = _run_decode(
             self.backend, self.layer, self.runner, seq_lens
         )
-        _run_graph_decode_consistency(self.layer, self.backend, batch, q, k, v, eager_out)
+        _run_graph_decode_consistency(
+            self.layer, self.backend, batch, q, k, v, eager_out, max_bs=max_bs
+        )
 
     def test_bsz1(self):
         self._run([8])
 
     def test_bsz4(self):
         self._run([4, 8, 16, 32])
+
+    def test_padded_max_bs(self):
+        # bsz=2, max_bs=8 — exercises padded static-buffer slicing
+        self._run([8, 16], max_bs=8)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
@@ -329,17 +349,23 @@ class TestFA3DecodeGraphConsistency(CustomTestCase):
         cls.backend = build_fa_backend(cls.runner, fa_version=3)
         cls.layer = _make_layer(cfg)
 
-    def _run(self, seq_lens):
+    def _run(self, seq_lens, max_bs=None):
         batch, q, k, v, eager_out = _run_decode(
             self.backend, self.layer, self.runner, seq_lens
         )
-        _run_graph_decode_consistency(self.layer, self.backend, batch, q, k, v, eager_out)
+        _run_graph_decode_consistency(
+            self.layer, self.backend, batch, q, k, v, eager_out, max_bs=max_bs
+        )
 
     def test_bsz1(self):
         self._run([8])
 
     def test_bsz4(self):
         self._run([4, 8, 16, 32])
+
+    def test_padded_max_bs(self):
+        # bsz=2, max_bs=8 — exercises padded static-buffer slicing
+        self._run([8, 16], max_bs=8)
 
 
 @unittest.skipIf(not _HAS_FA3 or not _FA3_AVAILABLE, "FA3 requires SM90+ and sgl_kernel.flash_attn")
