@@ -382,6 +382,55 @@ def make_extend_batch(
     return batch, kv_slot_map
 
 
+def make_split_prefill_batch(
+    prefix_lens: List[int],
+    extend_lens: List[int],
+    model_runner: MockModelRunner,
+    layer_id: int = 0,
+) -> Tuple[ForwardBatch, torch.Tensor]:
+    """
+    Build a ForwardBatch for SPLIT_PREFILL mode (chunked prefill).
+
+    SPLIT_PREFILL is handled by the same extend codepath (is_extend() returns True)
+    but uses a different forward_mode flag. The batch is constructed identically to an
+    extend batch, then forward_mode is overridden to SPLIT_PREFILL.
+    """
+    batch, kv_slot_map = make_extend_batch(
+        prefix_lens, extend_lens, model_runner, layer_id=layer_id
+    )
+    batch.forward_mode = ForwardMode.SPLIT_PREFILL
+    return batch, kv_slot_map
+
+
+def make_mixed_batch(
+    decode_seq_lens: List[int],
+    extend_prefix_lens: List[int],
+    extend_lens: List[int],
+    model_runner: MockModelRunner,
+    layer_id: int = 0,
+) -> Tuple[ForwardBatch, torch.Tensor]:
+    """
+    Build a ForwardBatch for MIXED mode (some decode + some extend requests).
+
+    Decode requests are represented as extend_len=1 with prefix_len=seq_len-1.
+    The combined batch is built via make_extend_batch and then forward_mode is
+    set to MIXED so backends exercise that branch.
+
+    Returns (forward_batch, kv_slot_map) using the same layout as make_extend_batch.
+    """
+    decode_prefix_lens = [s - 1 for s in decode_seq_lens]
+    decode_extend_lens = [1] * len(decode_seq_lens)
+
+    all_prefix_lens = decode_prefix_lens + extend_prefix_lens
+    all_extend_lens = decode_extend_lens + extend_lens
+
+    batch, kv_slot_map = make_extend_batch(
+        all_prefix_lens, all_extend_lens, model_runner, layer_id=layer_id
+    )
+    batch.forward_mode = ForwardMode.MIXED
+    return batch, kv_slot_map
+
+
 # ---------------------------------------------------------------------------
 # KV reconstruction
 # ---------------------------------------------------------------------------

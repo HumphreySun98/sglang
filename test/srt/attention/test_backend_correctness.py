@@ -39,6 +39,8 @@ from .utils import (
     hf_swa_reference,
     make_decode_batch,
     make_extend_batch,
+    make_mixed_batch,
+    make_split_prefill_batch,
     reconstruct_dense_kv,
     run_attn_forward,
 )
@@ -963,6 +965,286 @@ class TestFA3SWAExtend(CustomTestCase):
 
     def test_with_prefix(self):
         self._run([8, 16], [4, 4])
+
+
+# ---------------------------------------------------------------------------
+# SPLIT_PREFILL mode (chunked prefill) — triton, flashinfer, FA3
+# SPLIT_PREFILL uses the same extend codepath (is_extend()=True) so we just
+# override forward_mode on a standard extend batch.
+# ---------------------------------------------------------------------------
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+class TestTritonSplitPrefill(CustomTestCase):
+    """Triton backend, SPLIT_PREFILL mode (chunked prefill)."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_triton_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+
+        batch, kv_slot_map = make_split_prefill_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2,
+                     msg=f"SplitPrefill prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [16, 16])
+
+    def test_with_prefix(self):
+        self._run([8, 16], [8, 8])
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+class TestFlashInferSplitPrefill(CustomTestCase):
+    """FlashInfer backend, SPLIT_PREFILL mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_flashinfer_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+
+        batch, kv_slot_map = make_split_prefill_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2,
+                     msg=f"FI SplitPrefill prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [16, 16])
+
+    def test_with_prefix(self):
+        self._run([8, 16], [8, 8])
+
+
+@unittest.skipIf(not _HAS_FA3 or not _FA3_AVAILABLE, "FA3 requires SM90+ and sgl_kernel.flash_attn")
+class TestFA3SplitPrefill(CustomTestCase):
+    """FA3 backend, SPLIT_PREFILL mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG_PS1
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_fa_backend(cls.runner, fa_version=3)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+
+        batch, kv_slot_map = make_split_prefill_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2,
+                     msg=f"FA3 SplitPrefill prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [16, 16])
+
+    def test_with_prefix(self):
+        self._run([8, 16], [8, 8])
+
+
+# ---------------------------------------------------------------------------
+# MIXED mode (decode + extend in same batch) — triton, flashinfer, FA3
+# ---------------------------------------------------------------------------
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+class TestTritonMixed(CustomTestCase):
+    """Triton backend, MIXED mode (decode requests + extend requests in same batch)."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG  # GQA covers more code paths than pure MHA
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_triton_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, decode_seq_lens, extend_prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(decode_seq_lens) + len(extend_prefix_lens)
+
+        batch, kv_slot_map = make_mixed_batch(
+            decode_seq_lens, extend_prefix_lens, extend_lens, runner, layer_id=LAYER_ID
+        )
+
+        all_prefix = [s - 1 for s in decode_seq_lens] + extend_prefix_lens
+        all_extend = [1] * len(decode_seq_lens) + extend_lens
+        seq_lens = [p + e for p, e in zip(all_prefix, all_extend)]
+        total_extend = sum(all_extend)
+
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+
+        ext_offsets = [0] + list(torch.tensor(all_extend).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=all_prefix)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2,
+                     msg=f"Mixed decode={decode_seq_lens} ext_prefix={extend_prefix_lens} ext={extend_lens}")
+
+    def test_decode_only(self):
+        self._run([16, 32], [], [])
+
+    def test_mixed(self):
+        self._run([16, 32], [8, 16], [4, 8])
+
+    def test_extend_only(self):
+        self._run([], [8, 16], [4, 8])
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+class TestFlashInferMixed(CustomTestCase):
+    """FlashInfer backend, MIXED mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_flashinfer_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, decode_seq_lens, extend_prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(decode_seq_lens) + len(extend_prefix_lens)
+
+        batch, kv_slot_map = make_mixed_batch(
+            decode_seq_lens, extend_prefix_lens, extend_lens, runner, layer_id=LAYER_ID
+        )
+
+        all_prefix = [s - 1 for s in decode_seq_lens] + extend_prefix_lens
+        all_extend = [1] * len(decode_seq_lens) + extend_lens
+        seq_lens = [p + e for p, e in zip(all_prefix, all_extend)]
+        total_extend = sum(all_extend)
+
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+
+        ext_offsets = [0] + list(torch.tensor(all_extend).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=all_prefix)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2,
+                     msg=f"FI Mixed decode={decode_seq_lens} ext_prefix={extend_prefix_lens} ext={extend_lens}")
+
+    def test_mixed(self):
+        self._run([16, 32], [8, 16], [4, 8])
+
+    def test_decode_only(self):
+        self._run([16, 32], [], [])
+
+
+@unittest.skipIf(not _HAS_FA3 or not _FA3_AVAILABLE, "FA3 requires SM90+ and sgl_kernel.flash_attn")
+class TestFA3Mixed(CustomTestCase):
+    """FA3 backend, MIXED mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG_PS1
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_fa_backend(cls.runner, fa_version=3)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, decode_seq_lens, extend_prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(decode_seq_lens) + len(extend_prefix_lens)
+
+        batch, kv_slot_map = make_mixed_batch(
+            decode_seq_lens, extend_prefix_lens, extend_lens, runner, layer_id=LAYER_ID
+        )
+
+        all_prefix = [s - 1 for s in decode_seq_lens] + extend_prefix_lens
+        all_extend = [1] * len(decode_seq_lens) + extend_lens
+        seq_lens = [p + e for p, e in zip(all_prefix, all_extend)]
+        total_extend = sum(all_extend)
+
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+
+        ext_offsets = [0] + list(torch.tensor(all_extend).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=all_prefix)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2,
+                     msg=f"FA3 Mixed decode={decode_seq_lens} ext_prefix={extend_prefix_lens} ext={extend_lens}")
+
+    def test_mixed(self):
+        self._run([16, 32], [8, 16], [4, 8])
+
+    def test_decode_only(self):
+        self._run([16, 32], [], [])
 
 
 # ---------------------------------------------------------------------------
