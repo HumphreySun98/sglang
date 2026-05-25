@@ -36,6 +36,14 @@ RETRIABLE_PATTERNS = [
     r"timeout",
 ]
 
+# Patterns that should be retried even though they may appear inside RuntimeError
+# tracebacks. These cover transient ROCm/RCCL communicator initialization flakes.
+RETRIABLE_GPU_INIT_PATTERNS = [
+    r"NCCL error: unhandled cuda error",
+    r"RCCL.*unhandled cuda error",
+    r"ncclCommInitRank",
+]
+
 # Patterns that indicate non-retriable failures (real code errors)
 NON_RETRIABLE_PATTERNS = [
     r"SyntaxError",
@@ -61,6 +69,11 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     Returns:
         tuple: (is_retriable, reason)
     """
+    # Check forced retriable patterns before broad RuntimeError matching.
+    for pattern in RETRIABLE_GPU_INIT_PATTERNS:
+        if re.search(pattern, output, re.IGNORECASE):
+            return True, f"retriable gpu init pattern: {pattern}"
+
     # Check for non-retriable patterns first
     for pattern in NON_RETRIABLE_PATTERNS:
         if re.search(pattern, output, re.IGNORECASE):
@@ -77,6 +90,34 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
 
     # Default: not retriable
     return False, "unknown failure type"
+
+
+def cleanup_before_retry(filename: str, reason: str):
+    """Best-effort cleanup for AMD GPU worker processes before file-level retry."""
+    if os.environ.get("SGLANG_IS_IN_CI_AMD") != "1":
+        return
+
+    logger.info(f"[CI Retry] Cleaning up AMD GPU processes before retry: {reason}")
+    patterns = [
+        r"sglang\.bench_offline_throughput",
+        r"sglang\.launch_server",
+        r"sglang\.serve",
+        r"sglang serve",
+        r"bench_offline_throughput",
+    ]
+
+    for signal_name in ("TERM", "KILL"):
+        for pattern in patterns:
+            subprocess.run(
+                ["pkill", f"-{signal_name}", "-f", pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        if signal_name == "TERM":
+            time.sleep(5)
+
+    logger.info(f"[CI Retry] Cleanup complete for {filename}")
 
 
 def run_with_timeout(
@@ -242,6 +283,7 @@ def run_unittest_files(
 
                         if is_retriable:
                             logger.info(f"\n[CI Retry] {filename} failed with {reason}")
+                            cleanup_before_retry(filename, reason)
                             logger.info(
                                 f"[CI Retry] Waiting {retry_wait_seconds}s before retry...\n"
                             )

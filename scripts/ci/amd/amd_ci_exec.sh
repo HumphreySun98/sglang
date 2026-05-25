@@ -1,12 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# Detect GPU family from hostname (e.g., linux-mi35x-gpu-1-xxxxx-runner-zzzzz)
+# Detect GPU family from hostname.
 HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
-# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Host names look like:
+#   linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+#   linux-mi300-2gpu-sglang-xxxxx-runner-zzzzz
+if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)(-gpu-[0-9]+|-[0-9]+gpu)- ]]; then
   GPU_FAMILY="${BASH_REMATCH[1]}"
   echo "Detected GPU family from hostname: ${GPU_FAMILY}"
 else
@@ -18,6 +20,10 @@ declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
   [SGLANG_USE_AITER]=1
+  [NCCL_DEBUG]=INFO
+  [RCCL_DEBUG]=INFO
+  [NCCL_DEBUG_SUBSYS]=INIT,ENV,GRAPH
+  [TORCH_DISTRIBUTED_DEBUG]=DETAIL
 )
 
 # Conditionally add GPU_ARCHS only for mi35x
