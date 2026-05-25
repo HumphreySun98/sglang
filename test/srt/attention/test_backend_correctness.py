@@ -31,6 +31,7 @@ from .utils import (
     MockModelRunner,
     assert_close,
     build_fa_backend,
+    build_flex_backend,
     build_flashinfer_backend,
     build_torch_native_backend,
     build_triton_backend,
@@ -962,6 +963,156 @@ class TestFA3SWAExtend(CustomTestCase):
 
     def test_with_prefix(self):
         self._run([8, 16], [4, 4])
+
+
+# ---------------------------------------------------------------------------
+# FlexAttention backend — MHA, GQA (no SWA: sliding window not supported)
+# ---------------------------------------------------------------------------
+
+_HAS_FLEX = torch.cuda.is_available()
+try:
+    from torch.nn.attention.flex_attention import flex_attention as _flex_probe  # noqa: F401
+    _FLEX_AVAILABLE = True
+except Exception:
+    _FLEX_AVAILABLE = False
+
+
+@unittest.skipIf(not _HAS_FLEX or not _FLEX_AVAILABLE, "flex_attention requires CUDA and PyTorch >= 2.5")
+class TestFlexAttnMHADecode(CustomTestCase):
+    """FlexAttention backend, standard MHA, DECODE mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = GPT2_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_flex_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, seq_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(seq_lens)
+        batch, kv_slot_map = make_decode_batch(seq_lens, runner, layer_id=LAYER_ID)
+        q = _rand([bsz, cfg.num_heads, cfg.head_dim])
+        k = _rand([bsz, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([bsz, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        q_list = [q[r : r + 1] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FlexAttn MHA decode seq_lens={seq_lens}")
+
+    def test_bsz1(self):
+        self._run([8])
+
+    def test_bsz4(self):
+        self._run([4, 8, 16, 32])
+
+
+@unittest.skipIf(not _HAS_FLEX or not _FLEX_AVAILABLE, "flex_attention requires CUDA and PyTorch >= 2.5")
+class TestFlexAttnMHAExtend(CustomTestCase):
+    """FlexAttention backend, standard MHA, EXTEND mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = GPT2_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_flex_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+        batch, kv_slot_map = make_extend_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FlexAttn MHA extend prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [8, 8])
+
+    def test_with_prefix(self):
+        self._run([4, 8], [4, 4])
+
+
+@unittest.skipIf(not _HAS_FLEX or not _FLEX_AVAILABLE, "flex_attention requires CUDA and PyTorch >= 2.5")
+class TestFlexAttnGQADecode(CustomTestCase):
+    """FlexAttention backend, GQA, DECODE mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_flex_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, seq_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        bsz = len(seq_lens)
+        batch, kv_slot_map = make_decode_batch(seq_lens, runner, layer_id=LAYER_ID)
+        q = _rand([bsz, cfg.num_heads, cfg.head_dim])
+        k = _rand([bsz, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([bsz, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        q_list = [q[r : r + 1] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FlexAttn GQA decode seq_lens={seq_lens}")
+
+    def test_bsz1(self):
+        self._run([16])
+
+    def test_bsz4(self):
+        self._run([8, 16, 32, 64])
+
+
+@unittest.skipIf(not _HAS_FLEX or not _FLEX_AVAILABLE, "flex_attention requires CUDA and PyTorch >= 2.5")
+class TestFlexAttnGQAExtend(CustomTestCase):
+    """FlexAttention backend, GQA, EXTEND mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        torch.manual_seed(SEED)
+        cfg = LLAMA3_CONFIG
+        cls.cfg = cfg
+        cls.runner = MockModelRunner(cfg, device=DEVICE, dtype=DTYPE)
+        cls.backend = build_flex_backend(cls.runner)
+        cls.layer = _make_layer(cfg)
+
+    def _run(self, prefix_lens, extend_lens):
+        cfg, runner, backend, layer = self.cfg, self.runner, self.backend, self.layer
+        total_extend = sum(extend_lens)
+        bsz = len(prefix_lens)
+        batch, kv_slot_map = make_extend_batch(prefix_lens, extend_lens, runner, layer_id=LAYER_ID)
+        q = _rand([total_extend, cfg.num_heads, cfg.head_dim])
+        k = _rand([total_extend, cfg.num_kv_heads, cfg.head_dim])
+        v = _rand([total_extend, cfg.num_kv_heads, cfg.v_head_dim])
+        out = run_attn_forward(layer, backend, q, k, v, batch)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        k_list, v_list = reconstruct_dense_kv(batch, runner, LAYER_ID, kv_slot_map, seq_lens)
+        ext_offsets = [0] + list(torch.tensor(extend_lens).cumsum(0).tolist())
+        q_list = [q[ext_offsets[r] : ext_offsets[r + 1]] for r in range(bsz)]
+        ref = hf_sdpa_reference(q_list, k_list, v_list, scaling=layer.scaling, prefix_lens=prefix_lens)
+        assert_close(ref, out, atol=2e-2, rtol=2e-2, msg=f"FlexAttn GQA extend prefix={prefix_lens} extend={extend_lens}")
+
+    def test_no_prefix(self):
+        self._run([0, 0], [8, 8])
+
+    def test_with_prefix(self):
+        self._run([16, 32], [8, 8])
 
 
 if __name__ == "__main__":

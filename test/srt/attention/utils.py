@@ -566,6 +566,12 @@ def build_fa_backend(model_runner: MockModelRunner, fa_version: int = 3):
     return FlashAttentionBackend(model_runner, fa_impl_ver=fa_version)
 
 
+def build_flex_backend(model_runner: MockModelRunner):
+    """Construct TorchFlexAttnBackend (no SWA support)."""
+    from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend
+    return TorchFlexAttnBackend(model_runner)
+
+
 # ---------------------------------------------------------------------------
 # Forward runner
 # ---------------------------------------------------------------------------

@@ -14,6 +14,15 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+
+def _decode_mask(b, h, q_idx, kv_idx):
+    # decode: q is at position 0; attend to all kv positions
+    return q_idx <= kv_idx
+
+
 class TorchFlexAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -43,7 +52,7 @@ class TorchFlexAttnBackend(AttentionBackend):
                 seq_len_q = seq_len_kv
                 self.extend_block_masks.append(
                     create_block_mask(
-                        self._causal_mask,
+                        _causal_mask,
                         None,
                         None,
                         seq_len_q,
@@ -60,7 +69,7 @@ class TorchFlexAttnBackend(AttentionBackend):
 
                 self.decode_block_masks.append(
                     create_block_mask(
-                        self._decode_mask,
+                        _decode_mask,
                         None,
                         None,
                         seq_len_q,
@@ -69,12 +78,6 @@ class TorchFlexAttnBackend(AttentionBackend):
                         _compile=False,
                     )
                 )
-
-    def _causal_mask(self, b, h, q_idx, kv_idx):
-        return q_idx >= kv_idx
-
-    def _decode_mask(self, b, h, q_idx, kv_idx):
-        return q_idx <= kv_idx
 
     def _run_flex_forward_extend(
         self,
